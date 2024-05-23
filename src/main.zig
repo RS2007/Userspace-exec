@@ -11,7 +11,7 @@ const c = @cImport({
 });
 
 pub fn main() anyerror!void {
-    try elf.test_elf_parse();
+    try elf.testElfParse();
 }
 
 pub fn test_bs() !void {
