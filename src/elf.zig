@@ -5,8 +5,12 @@ const PROT_READ = std.os.linux.PROT.READ;
 const PROT_EXEC = std.os.linux.PROT.EXEC;
 const PROT_WRITE = std.os.linux.PROT.WRITE;
 
+fn roundToNextPage(n: usize) usize {
+    return (@divFloor(n, std.mem.page_size) + 1) * std.mem.page_size;
+}
+
 pub fn testElfParse() !void {
-    var file = try std.fs.cwd().openFile("add2.o", .{});
+    var file = try std.fs.cwd().openFile("add3.o", .{});
     defer file.close();
     var buffer: [32168]u8 = undefined;
     std.debug.print("Reading add.o file...\n", .{});
@@ -27,19 +31,14 @@ pub fn testElfParse() !void {
         sectionIndx += 1;
     }
     const sectionHeaderStringTable = sectionHeaders.items[shstrndx];
-    // var sectionStringList = buffer[sectionHeaderStringTable.sh_offset..][0..sectionHeaderStringTable.sh_size];
-    // std.debug.print("Header: {any}\n", .{elfHeader});
-    // std.debug.print("Section Header num: {}\n", .{sectionNumber});
-    // std.debug.print("Section String list: {s}\n", .{sectionStringList});
     const symtab = getSection(sectionHeaders, sectionHeaderStringTable, ".symtab", &buffer).?;
     const strtab = getSection(sectionHeaders, sectionHeaderStringTable, ".strtab", &buffer).?;
     const text = getSection(sectionHeaders, sectionHeaderStringTable, ".text", &buffer).?;
-    // std.debug.print("symtab: {any}\n", .{symtab});
-    // std.debug.print("strtab: {any}\n", .{strtab});
-    // std.debug.print("text: {any}\n", .{text});
-    // const symbolTable = buffer[strtab.sh_offset..][0..strtab.sh_size];
-    // std.debug.print("symtab: {s}\n", .{symbolTable});
+    const dataSec = getSection(sectionHeaders, sectionHeaderStringTable, ".data", &buffer).?;
+    const rodataSec = getSection(sectionHeaders, sectionHeaderStringTable, ".rodata", &buffer).?;
     const code = buffer[text.sh_offset..][0..text.sh_size];
+    const data = buffer[dataSec.sh_offset..][0..dataSec.sh_size];
+    const rodata = buffer[rodataSec.sh_offset..][0..rodataSec.sh_size];
     var symbolIndx: usize = 0;
     const symbolNumber: usize = @divExact(symtab.sh_size, @sizeOf(Elf.Elf64_Sym));
     var symbols = std.ArrayList(Elf.Elf64_Sym).init(allocator);
@@ -49,40 +48,65 @@ pub fn testElfParse() !void {
         try symbols.append(symbolEntry.*);
         symbolIndx += 1;
     }
-    const mainFnSymbol = getSymbol(symbols, strtab, "add3", &buffer).?;
-    // std.debug.print("{x}", .{mainFnSymbol.st_value});
-    const mmapedCode: *align(4096) [4096]u8 = @ptrCast(@alignCast(std.c.mmap(null, 4096, PROT_READ | PROT_WRITE, std.os.linux.MAP{ .ANONYMOUS = true, .TYPE = std.os.linux.MAP_TYPE.PRIVATE }, -1, 0)));
-    //var toWrite = code[0x38..][0..];
-    //toWrite = @as([]u8, 0xFFFFFFC4);
+    const get_varSym = getSymbol(symbols, strtab, "get_var", &buffer).?;
+    const set_varSym = getSymbol(symbols, strtab, "set_var", &buffer).?;
+    const get_helloSym = getSymbol(symbols, strtab, "get_hello", &buffer).?;
+    const mmapedCode = @as([*]u8, @ptrCast(@as(*align(4096) anyopaque, (@alignCast(std.c.mmap(null, roundToNextPage(text.sh_size) + roundToNextPage(dataSec.sh_size) + roundToNextPage(rodataSec.sh_size), PROT_READ | PROT_WRITE, std.os.linux.MAP{ .ANONYMOUS = true, .TYPE = std.os.linux.MAP_TYPE.PRIVATE }, -1, 0))))))[0 .. 3 * 4096];
 
-    @memcpy(mmapedCode.*[0..text.sh_size], code);
-    // std.debug.print("You are the problem: {}\n", .{mmapedCode.len});
-    //const relocs = try getRelocs(&buffer, sectionHeaders, sectionHeaderStringTable, allocator);
+    @memcpy(mmapedCode[0..code.len], code);
+    @memcpy(mmapedCode[roundToNextPage(code.len) .. roundToNextPage(code.len) + data.len], data);
+    @memcpy(mmapedCode[roundToNextPage(code.len) + roundToNextPage(data.len) .. roundToNextPage(code.len) + roundToNextPage(data.len) + rodata.len], rodata);
 
     const relocs = try getRelocs(&buffer, sectionHeaders, sectionHeaderStringTable, allocator);
-    // INFO: relocation happens here
-    //const castedToComplement: [4]u8 = @bitCast(@as(i32, @intCast(-0x4c)));
-    //@memcpy(mmapedCode.*[mainFnSymbol.st_value + 24 .. mainFnSymbol.st_value + 28], &castedToComplement);
+
     for (relocs.items) |reloc| {
+        const associatedSectionWithSym = symbols.items[reloc.r_sym()].st_shndx;
+        const symAddress = switch (associatedSectionWithSym) {
+            1 => symbols.items[reloc.r_sym()].st_value,
+            3 => roundToNextPage(code.len) + symbols.items[reloc.r_sym()].st_value,
+            5 => roundToNextPage(code.len) + roundToNextPage(data.len) + symbols.items[reloc.r_sym()].st_value,
+            else => null,
+        };
+        switch (associatedSectionWithSym) {
+            1 => {},
+            3 => {
+                std.debug.print("3:{d}\n", .{mmapedCode[symAddress.? .. symAddress.? + 4]});
+            },
+            5 => {
+                std.debug.print("5: {s}\n", .{mmapedCode[symAddress.?..]});
+            },
+            else => {},
+        }
+        const relAdrToBePatched = mmapedCode[reloc.r_offset..];
+        _ = relAdrToBePatched;
+        std.log.warn("{any} and {any} \n", .{ associatedSectionWithSym, symAddress });
         switch (reloc.r_type()) {
             4 => {
-                const casted: [4]u8 = @bitCast(@as(i32, @intCast((@as(i64, @intCast(sectionHeaders.items[mainFnSymbol.st_shndx].sh_addr))) +
-                    @as(i64, @intCast(getSymbol(symbols, strtab, "add2", &buffer).?.st_value)) +
-                    -@as(i64, @intCast(reloc.r_offset)) +
-                    reloc.r_addend)));
+                const casted: [4]u8 = @bitCast(
+                    @as(i32, @intCast(symAddress.?)) - @as(i32, @intCast(reloc.r_offset)) - @as(i32, @intCast(reloc.r_addend)),
+                );
                 @memcpy(mmapedCode[reloc.r_offset .. reloc.r_offset + 4], &casted);
             },
-            else => {
-                std.debug.assert(false);
+            2 => {
+                const casted: [4]u8 = @bitCast(@as(i32, @intCast(symAddress.?)) + @as(i32, @intCast(reloc.r_addend)) - @as(i32, @intCast(reloc.r_offset)));
+                @memcpy(mmapedCode[reloc.r_offset .. reloc.r_offset + 4], &casted);
+            },
+            else => |typ| {
+                std.debug.print("Unhandled type: {}\n", .{typ});
             },
         }
     }
 
     const backToOpq: *align(4096) anyopaque = @ptrCast(@alignCast(mmapedCode));
     _ = std.c.mprotect(backToOpq, text.sh_size, PROT_READ | PROT_EXEC);
-    // std.debug.print("length of buffer mmapedCode: {}, text.sh_size: {}\n", .{ mmapedCode.len, text.sh_size });
-    const casted: *fn (i32, i32, i32) i32 = @ptrCast(mmapedCode[mainFnSymbol.st_value..]);
-    std.debug.print("add({},{},{}) = {}\n", .{ 2, 3, 5, casted(2, 3, 5) });
+    const castedGetVar: *fn () u32 = @ptrCast(mmapedCode[get_varSym.st_value..]);
+    const castedSetVar: *fn (c_int) void = @ptrCast(mmapedCode[set_varSym.st_value..]);
+    const castedGetHello: *fn () [*c]const u8 = @ptrCast(mmapedCode[get_helloSym.st_value..]);
+    const ans1 = castedGetVar();
+    std.debug.print("get_var() = {d}\n", .{ans1});
+    castedSetVar(4);
+    std.debug.print("get_var() after set_var(4) = {d}\n", .{castedGetVar()});
+    std.debug.print("get_hello()  = {s}\n", .{std.mem.span(castedGetHello())});
 }
 
 pub fn getRelocs(buffer: []u8, sections: std.ArrayList(Elf.Elf64_Shdr), shstrtab: Elf.Elf64_Shdr, allocator: std.mem.Allocator) !std.ArrayList(Elf.Elf64_Rela) {

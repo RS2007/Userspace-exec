@@ -1,4 +1,9 @@
+## Progress
+
 - Currently reads an add function from `add.o` and executes it from zig.
+- Performs relocation for static .o functions for function calls, global variables and strings(text,data and rodata respectively).
+
+![progress](./.github/progress.png)
 
 To compile add.c:
 
@@ -19,7 +24,6 @@ To execute the add function via zig:
 zig build run
 ```
 
-![alt text](image.png)
 
 ## References
 
